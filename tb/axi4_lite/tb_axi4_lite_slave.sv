@@ -34,7 +34,6 @@ module tb_axi4_lite_slave;
   localparam int DATA_WIDTH = 32;
   localparam int STRB_WIDTH = DATA_WIDTH / 8;
   localparam int CLK_PERIOD = 10;
-  localparam int TIMEOUT_CYCLES = 1000;
 
   // Clock and Reset
   logic aclk;
@@ -85,29 +84,27 @@ module tb_axi4_lite_slave;
   endtask
 
   // ══════════════════════════════════════════
-  // TASK: Wait for posedge clock (clean helper)
-  // ══════════════════════════════════════════
-  task automatic wait_clk(int n = 1);
-    repeat(n) @(posedge aclk);
-  endtask
-
-  // ══════════════════════════════════════════
   // TASK: Apply Reset
   // ══════════════════════════════════════════
   task automatic apply_reset();
     $display("[%0t] Applying Reset...", $time);
     aresetn = 1'b0;
     init_signals();
-    wait_clk(5);
+    repeat (5) @(posedge aclk);
     aresetn = 1'b1;
-    wait_clk(2);
+    repeat (2) @(posedge aclk);
     $display("[%0t] Reset Released.\n", $time);
   endtask
 
   // ══════════════════════════════════════════
   // TASK: AXI Write (simultaneous AW+W)
-  // Drive signals using NBA (#1 delay),
-  // then check handshake on subsequent cycles.
+  //
+  // Simple approach for Verilator:
+  // 1. Drive AW+W+BREADY, hold for multiple cycles
+  // 2. Wait until bvalid seen
+  // 3. Clean up
+  //
+  // No fork-join needed - much simpler and reliable
   // ══════════════════════════════════════════
   task automatic axi_write(
     input  logic [ADDR_WIDTH-1:0] addr,
@@ -115,9 +112,10 @@ module tb_axi4_lite_slave;
     input  logic [STRB_WIDTH-1:0] strb,
     output logic [1:0]            resp
   );
-    int timeout_cnt;
+    int cnt;
+    logic aw_done, w_done;
 
-    // Drive AW + W + BREADY
+    // Drive everything at once
     @(posedge aclk);
     #1;
     axi_if.awaddr  = addr;
@@ -128,62 +126,58 @@ module tb_axi4_lite_slave;
     axi_if.wvalid  = 1'b1;
     axi_if.bready  = 1'b1;
 
-    // Wait for AW handshake
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
+    aw_done = 1'b0;
+    w_done  = 1'b0;
+    cnt     = 0;
+
+    // Wait for all three handshakes: AW, W, and B
+    while (cnt < 100) begin
       @(posedge aclk);
-      if (axi_if.awvalid && axi_if.awready) begin
+
+      // Check AW handshake
+      if (!aw_done && axi_if.awvalid && axi_if.awready) begin
+        aw_done = 1'b1;
         #1;
         axi_if.awvalid = 1'b0;
-        break;
       end
-      timeout_cnt++;
-    end
 
-    // Wait for W handshake (might already be done)
-    timeout_cnt = 0;
-    while (axi_if.wvalid && timeout_cnt < TIMEOUT_CYCLES) begin
-      @(posedge aclk);
-      if (axi_if.wvalid && axi_if.wready) begin
+      // Check W handshake
+      if (!w_done && axi_if.wvalid && axi_if.wready) begin
+        w_done = 1'b1;
         #1;
         axi_if.wvalid = 1'b0;
-        break;
       end
-      timeout_cnt++;
-    end
 
-    // Wait for B response
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
-      @(posedge aclk);
+      // Check B handshake (this means write is complete)
       if (axi_if.bvalid && axi_if.bready) begin
         resp = axi_if.bresp;
         #1;
         axi_if.bready = 1'b0;
         break;
       end
-      timeout_cnt++;
+
+      cnt++;
     end
 
-    if (timeout_cnt >= TIMEOUT_CYCLES) begin
-      $display("[%0t] ERROR: Write timeout! addr=0x%08h", $time, addr);
+    if (cnt >= 100) begin
+      $display("[%0t] ERROR: Write timeout! addr=0x%08h aw_done=%0b w_done=%0b",
+               $time, addr, aw_done, w_done);
       resp = 2'b11;
+      #1;
+      axi_if.awvalid = 1'b0;
+      axi_if.wvalid  = 1'b0;
+      axi_if.bready  = 1'b0;
     end else begin
       $display("[%0t] WRITE: addr=0x%08h data=0x%08h strb=4'b%04b resp=%s",
                $time, addr, data, strb,
                (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
     end
 
-    // Cleanup
-    #1;
-    axi_if.awvalid = 1'b0;
-    axi_if.wvalid  = 1'b0;
-    axi_if.bready  = 1'b0;
     @(posedge aclk);
   endtask
 
   // ══════════════════════════════════════════
-  // TASK: AXI Write - AW first, then W
+  // TASK: AXI Write - AW first, then W later
   // ══════════════════════════════════════════
   task automatic axi_write_aw_first(
     input  logic [ADDR_WIDTH-1:0] addr,
@@ -191,11 +185,11 @@ module tb_axi4_lite_slave;
     input  int                    delay,
     output logic [1:0]            resp
   );
-    int timeout_cnt;
+    int cnt;
 
     $display("[%0t] WRITE(AW-first, %0d delay): addr=0x%08h", $time, delay, addr);
 
-    // Send AW
+    // Phase 1: Send AW only
     @(posedge aclk);
     #1;
     axi_if.awaddr  = addr;
@@ -203,62 +197,53 @@ module tb_axi4_lite_slave;
     axi_if.awvalid = 1'b1;
     axi_if.bready  = 1'b1;
 
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
+    // Wait AW handshake
+    cnt = 0;
+    while (cnt < 100) begin
       @(posedge aclk);
       if (axi_if.awvalid && axi_if.awready) begin
         #1;
         axi_if.awvalid = 1'b0;
         break;
       end
-      timeout_cnt++;
+      cnt++;
     end
 
-    // Delay
-    wait_clk(delay);
+    // Delay between AW and W
+    repeat (delay) @(posedge aclk);
 
-    // Send W
+    // Phase 2: Send W
     #1;
     axi_if.wdata  = data;
     axi_if.wstrb  = '1;
     axi_if.wvalid = 1'b1;
 
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
+    // Wait W handshake + B response
+    cnt = 0;
+    while (cnt < 100) begin
       @(posedge aclk);
+
       if (axi_if.wvalid && axi_if.wready) begin
         #1;
         axi_if.wvalid = 1'b0;
-        break;
       end
-      timeout_cnt++;
-    end
 
-    // Wait B
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
-      @(posedge aclk);
       if (axi_if.bvalid && axi_if.bready) begin
         resp = axi_if.bresp;
         #1;
         axi_if.bready = 1'b0;
         break;
       end
-      timeout_cnt++;
+      cnt++;
     end
 
     $display("[%0t]   -> resp=%s", $time,
              (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
-
-    #1;
-    axi_if.awvalid = 1'b0;
-    axi_if.wvalid  = 1'b0;
-    axi_if.bready  = 1'b0;
     @(posedge aclk);
   endtask
 
   // ══════════════════════════════════════════
-  // TASK: AXI Write - W first, then AW
+  // TASK: AXI Write - W first, then AW later
   // ══════════════════════════════════════════
   task automatic axi_write_w_first(
     input  logic [ADDR_WIDTH-1:0] addr,
@@ -266,11 +251,11 @@ module tb_axi4_lite_slave;
     input  int                    delay,
     output logic [1:0]            resp
   );
-    int timeout_cnt;
+    int cnt;
 
     $display("[%0t] WRITE(W-first, %0d delay): addr=0x%08h", $time, delay, addr);
 
-    // Send W first
+    // Phase 1: Send W only
     @(posedge aclk);
     #1;
     axi_if.wdata  = data;
@@ -278,57 +263,48 @@ module tb_axi4_lite_slave;
     axi_if.wvalid = 1'b1;
     axi_if.bready = 1'b1;
 
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
+    // Wait W handshake
+    cnt = 0;
+    while (cnt < 100) begin
       @(posedge aclk);
       if (axi_if.wvalid && axi_if.wready) begin
         #1;
         axi_if.wvalid = 1'b0;
         break;
       end
-      timeout_cnt++;
+      cnt++;
     end
 
-    // Delay
-    wait_clk(delay);
+    // Delay between W and AW
+    repeat (delay) @(posedge aclk);
 
-    // Send AW
+    // Phase 2: Send AW
     #1;
     axi_if.awaddr  = addr;
     axi_if.awprot  = 3'b000;
     axi_if.awvalid = 1'b1;
 
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
+    // Wait AW handshake + B response
+    cnt = 0;
+    while (cnt < 100) begin
       @(posedge aclk);
+
       if (axi_if.awvalid && axi_if.awready) begin
         #1;
         axi_if.awvalid = 1'b0;
-        break;
       end
-      timeout_cnt++;
-    end
 
-    // Wait B
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
-      @(posedge aclk);
       if (axi_if.bvalid && axi_if.bready) begin
         resp = axi_if.bresp;
         #1;
         axi_if.bready = 1'b0;
         break;
       end
-      timeout_cnt++;
+      cnt++;
     end
 
     $display("[%0t]   -> resp=%s", $time,
              (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
-
-    #1;
-    axi_if.awvalid = 1'b0;
-    axi_if.wvalid  = 1'b0;
-    axi_if.bready  = 1'b0;
     @(posedge aclk);
   endtask
 
@@ -340,9 +316,9 @@ module tb_axi4_lite_slave;
     output logic [DATA_WIDTH-1:0] data,
     output logic [1:0]            resp
   );
-    int timeout_cnt;
+    int cnt;
+    logic ar_done;
 
-    // Drive AR
     @(posedge aclk);
     #1;
     axi_if.araddr  = addr;
@@ -350,22 +326,20 @@ module tb_axi4_lite_slave;
     axi_if.arvalid = 1'b1;
     axi_if.rready  = 1'b1;
 
-    // Wait for AR handshake
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
+    ar_done = 1'b0;
+    cnt = 0;
+
+    while (cnt < 100) begin
       @(posedge aclk);
-      if (axi_if.arvalid && axi_if.arready) begin
+
+      // Check AR handshake
+      if (!ar_done && axi_if.arvalid && axi_if.arready) begin
+        ar_done = 1'b1;
         #1;
         axi_if.arvalid = 1'b0;
-        break;
       end
-      timeout_cnt++;
-    end
 
-    // Wait for R response
-    timeout_cnt = 0;
-    while (timeout_cnt < TIMEOUT_CYCLES) begin
-      @(posedge aclk);
+      // Check R handshake
       if (axi_if.rvalid && axi_if.rready) begin
         data = axi_if.rdata;
         resp = axi_if.rresp;
@@ -373,22 +347,22 @@ module tb_axi4_lite_slave;
         axi_if.rready = 1'b0;
         break;
       end
-      timeout_cnt++;
+      cnt++;
     end
 
-    if (timeout_cnt >= TIMEOUT_CYCLES) begin
+    if (cnt >= 100) begin
       $display("[%0t] ERROR: Read timeout! addr=0x%08h", $time, addr);
       data = 32'hXXXXXXXX;
       resp = 2'b11;
+      #1;
+      axi_if.arvalid = 1'b0;
+      axi_if.rready  = 1'b0;
     end else begin
       $display("[%0t] READ:  addr=0x%08h data=0x%08h resp=%s",
                $time, addr, data,
                (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
     end
 
-    #1;
-    axi_if.arvalid = 1'b0;
-    axi_if.rready  = 1'b0;
     @(posedge aclk);
   endtask
 
@@ -479,7 +453,7 @@ module tb_axi4_lite_slave;
     axi_write(REG_DATA_TX_OFFSET, 32'h12345678, 4'b1111, wr_resp);
     check_resp(wr_resp, RESP_OKAY, "DATA_TX write resp");
     read_and_check(REG_DATA_TX_OFFSET, 32'h12345678, "DATA_TX readback");
-    wait_clk(3);
+    repeat (3) @(posedge aclk);
     read_and_check(REG_DATA_RX_OFFSET, 32'h12345678, "DATA_RX loopback");
 
     // ── TEST 6: Write to READ-ONLY VERSION ──
@@ -553,14 +527,14 @@ module tb_axi4_lite_slave;
 
     read_and_check(REG_CTRL_OFFSET,    32'h11111111, "Final CTRL");
     read_and_check(REG_DATA_TX_OFFSET, 32'h22222222, "Final DATA_TX");
-    wait_clk(3);
+    repeat (3) @(posedge aclk);
     read_and_check(REG_DATA_RX_OFFSET, 32'h22222222, "Final DATA_RX");
     read_and_check(REG_IRQ_EN_OFFSET,  32'h33333333, "Final IRQ_EN");
     read_and_check(REG_SCRATCH_OFFSET, 32'h44444444, "Final SCRATCH");
     read_and_check(REG_VERSION_OFFSET, IP_VERSION,    "Final VERSION");
 
     // ── SUMMARY ──
-    wait_clk(10);
+    repeat (10) @(posedge aclk);
     $display("\n");
     $display("==================================================");
     $display("  TEST SUMMARY");
