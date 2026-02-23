@@ -106,8 +106,7 @@ module tb_axi4_lite_slave;
 
   // ══════════════════════════════════════════
   // TASK: AXI Write (simultaneous AW+W)
-  //
-  // Verilator-safe: Drive signals using NBA (#1 delay),
+  // Drive signals using NBA (#1 delay),
   // then check handshake on subsequent cycles.
   // ══════════════════════════════════════════
   task automatic axi_write(
