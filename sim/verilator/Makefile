@@ -65,4 +65,4 @@ clean:
 	rm -f $(WAVE_DIR)/axi4_lite_slave.vcd
 FILEEND
 
-echo "✅ Makefile updated"
+echo "✅ Makefile updated with -Wno-fatal -Wno-TIMESCALEMOD -Wno-UNUSEDPARAM"
