@@ -52,23 +52,21 @@ module axi4_lite_slave
   // Register file
   logic [DATA_WIDTH-1:0] registers [NUM_REGS];
 
-  // Write FSM
-  typedef enum logic [1:0] {
-    S_WR_IDLE    = 2'b00,
-    S_WR_GOT_AW = 2'b01,
-    S_WR_GOT_W  = 2'b10,
-    S_WR_RESP   = 2'b11
+  // Write FSM - now 4 states with explicit WRITE state
+  typedef enum logic [2:0] {
+    S_WR_IDLE    = 3'b000,
+    S_WR_GOT_AW = 3'b001,
+    S_WR_GOT_W  = 3'b010,
+    S_WR_WRITE  = 3'b011,  // NEW: do actual register write here
+    S_WR_RESP   = 3'b100   // send BVALID, wait for BREADY
   } wr_state_e;
 
   wr_state_e wr_state_q;
 
-  // Latched write address, data, strobes
+  // Latched values (stable one cycle after handshake)
   logic [ADDR_WIDTH-1:0] aw_addr_q;
   logic [DATA_WIDTH-1:0] w_data_q;
   logic [STRB_WIDTH-1:0] w_strb_q;
-
-  // Write done flag - HIGH for exactly one cycle when register should be written
-  logic wr_do_write;
 
   // Read FSM
   typedef enum logic {
@@ -86,88 +84,72 @@ module axi4_lite_slave
   assign ar_fire = slv.arvalid & slv.arready;
   assign r_fire  = slv.rvalid  & slv.rready;
 
-  // AWREADY and WREADY
+  // Ready signals
   assign slv.awready = (wr_state_q == S_WR_IDLE) || (wr_state_q == S_WR_GOT_W);
   assign slv.wready  = (wr_state_q == S_WR_IDLE) || (wr_state_q == S_WR_GOT_AW);
-
-  // ARREADY
   assign slv.arready = (rd_state_q == S_RD_IDLE);
 
   // ══════════════════════════════════════════
-  // WRITE FSM + LATCH + RESPONSE - All in one block
-  // This ensures everything is evaluated together
+  // WRITE FSM + LATCH
   // ══════════════════════════════════════════
   always_ff @(posedge slv.aclk or negedge slv.aresetn) begin
     if (!slv.aresetn) begin
-      wr_state_q   <= S_WR_IDLE;
-      aw_addr_q    <= '0;
-      w_data_q     <= '0;
-      w_strb_q     <= '0;
-      wr_do_write  <= 1'b0;
-      slv.bvalid   <= 1'b0;
-      slv.bresp    <= 2'b00;
+      wr_state_q <= S_WR_IDLE;
+      aw_addr_q  <= '0;
+      w_data_q   <= '0;
+      w_strb_q   <= '0;
+      slv.bvalid <= 1'b0;
+      slv.bresp  <= 2'b00;
     end else begin
 
-      // Default: clear write pulse
-      wr_do_write <= 1'b0;
-
       case (wr_state_q)
-        // ─────────────────────────────────────
+
         S_WR_IDLE: begin
+          slv.bvalid <= 1'b0;
           if (aw_fire && w_fire) begin
-            // Both arrived same cycle: latch both, go to RESP
             aw_addr_q  <= slv.awaddr;
             w_data_q   <= slv.wdata;
             w_strb_q   <= slv.wstrb;
-            wr_state_q <= S_WR_RESP;
-            // Assert BVALID and set write flag for next cycle
-            slv.bvalid  <= 1'b1;
-            slv.bresp   <= (slv.awaddr < ADDR_MAX) ? RESP_OKAY : RESP_SLVERR;
-            wr_do_write <= 1'b1;
+            wr_state_q <= S_WR_WRITE;
           end else if (aw_fire) begin
-            // Only AW arrived: latch address, wait for W
             aw_addr_q  <= slv.awaddr;
             wr_state_q <= S_WR_GOT_AW;
           end else if (w_fire) begin
-            // Only W arrived: latch data, wait for AW
             w_data_q   <= slv.wdata;
             w_strb_q   <= slv.wstrb;
             wr_state_q <= S_WR_GOT_W;
           end
         end
 
-        // ─────────────────────────────────────
         S_WR_GOT_AW: begin
-          // Address already latched, waiting for W
           if (w_fire) begin
             w_data_q   <= slv.wdata;
             w_strb_q   <= slv.wstrb;
-            wr_state_q <= S_WR_RESP;
-            slv.bvalid  <= 1'b1;
-            slv.bresp   <= (aw_addr_q < ADDR_MAX) ? RESP_OKAY : RESP_SLVERR;
-            wr_do_write <= 1'b1;
+            wr_state_q <= S_WR_WRITE;
           end
         end
 
-        // ─────────────────────────────────────
         S_WR_GOT_W: begin
-          // Data already latched, waiting for AW
           if (aw_fire) begin
             aw_addr_q  <= slv.awaddr;
-            wr_state_q <= S_WR_RESP;
-            slv.bvalid  <= 1'b1;
-            slv.bresp   <= (slv.awaddr < ADDR_MAX) ? RESP_OKAY : RESP_SLVERR;
-            wr_do_write <= 1'b1;
+            wr_state_q <= S_WR_WRITE;
           end
         end
 
-        // ─────────────────────────────────────
+        // NEW STATE: Values are NOW stable in aw_addr_q, w_data_q, w_strb_q
+        // Register write happens in separate always_ff below
+        // Assert BVALID here
+        S_WR_WRITE: begin
+          slv.bvalid <= 1'b1;
+          slv.bresp  <= (aw_addr_q < ADDR_MAX) ? RESP_OKAY : RESP_SLVERR;
+          wr_state_q <= S_WR_RESP;
+        end
+
         S_WR_RESP: begin
           if (b_fire) begin
-            // Master accepted response
-            slv.bvalid  <= 1'b0;
-            slv.bresp   <= 2'b00;
-            wr_state_q  <= S_WR_IDLE;
+            slv.bvalid <= 1'b0;
+            slv.bresp  <= 2'b00;
+            wr_state_q <= S_WR_IDLE;
           end
         end
 
@@ -182,60 +164,15 @@ module axi4_lite_slave
   // ══════════════════════════════════════════
   // REGISTER FILE: Write Logic
   //
-  // KEY INSIGHT: wr_do_write fires on the SAME cycle
-  // that aw_addr_q and w_data_q are being latched.
-  // So we need to use the VALUES BEING LATCHED, not
-  // the old latched values.
-  //
-  // Solution: We compute the write address and data
-  // from the CURRENT inputs (not from _q registers)
-  // when writing.
+  // Write happens when FSM is in S_WR_WRITE state.
+  // At this point aw_addr_q and w_data_q are GUARANTEED
+  // stable (they were latched on the previous cycle).
   // ══════════════════════════════════════════
-
-  // Combinational: select the correct address and data for writing
-  logic [ADDR_WIDTH-1:0] wr_final_addr;
-  logic [DATA_WIDTH-1:0] wr_final_data;
-  logic [STRB_WIDTH-1:0] wr_final_strb;
-
-  always_comb begin
-    wr_final_addr = aw_addr_q;
-    wr_final_data = w_data_q;
-    wr_final_strb = w_strb_q;
-
-    case (wr_state_q)
-      S_WR_IDLE: begin
-        // Both arriving now: use direct bus values
-        if (aw_fire && w_fire) begin
-          wr_final_addr = slv.awaddr;
-          wr_final_data = slv.wdata;
-          wr_final_strb = slv.wstrb;
-        end
-      end
-      S_WR_GOT_AW: begin
-        // AW was latched before, W arriving now
-        if (w_fire) begin
-          wr_final_addr = aw_addr_q;     // Already latched
-          wr_final_data = slv.wdata;     // Current
-          wr_final_strb = slv.wstrb;     // Current
-        end
-      end
-      S_WR_GOT_W: begin
-        // W was latched before, AW arriving now
-        if (aw_fire) begin
-          wr_final_addr = slv.awaddr;    // Current
-          wr_final_data = w_data_q;      // Already latched
-          wr_final_strb = w_strb_q;      // Already latched
-        end
-      end
-      default: ;
-    endcase
-  end
-
   logic [$clog2(NUM_REGS)-1:0] wr_idx;
-  assign wr_idx = wr_final_addr[ADDR_MSB:ADDR_LSB];
+  assign wr_idx = aw_addr_q[ADDR_MSB:ADDR_LSB];
 
   logic wr_addr_ok;
-  assign wr_addr_ok = (wr_final_addr < ADDR_MAX);
+  assign wr_addr_ok = (aw_addr_q < ADDR_MAX);
 
   always_ff @(posedge slv.aclk or negedge slv.aresetn) begin
     if (!slv.aresetn) begin
@@ -248,43 +185,43 @@ module axi4_lite_slave
       registers[REG_SCRATCH]  <= '0;
       registers[REG_VERSION]  <= IP_VERSION;
     end else begin
-      // Hardware-driven updates
+      // Hardware-driven (every cycle)
       registers[REG_VERSION]      <= IP_VERSION;
       registers[REG_STATUS][0]    <= registers[REG_CTRL][0];
       registers[REG_STATUS][31:1] <= '0;
       registers[REG_DATA_RX]     <= registers[REG_DATA_TX];
 
-      // AXI write using combinational final values
-      if (wr_do_write && wr_addr_ok) begin
+      // AXI write: only in S_WR_WRITE state with valid address
+      if (wr_state_q == S_WR_WRITE && wr_addr_ok) begin
         case (wr_idx)
           REG_CTRL: begin
             for (int b = 0; b < STRB_WIDTH; b++)
-              if (wr_final_strb[b])
-                registers[REG_CTRL][b*8 +: 8] <= wr_final_data[b*8 +: 8];
+              if (w_strb_q[b])
+                registers[REG_CTRL][b*8 +: 8] <= w_data_q[b*8 +: 8];
           end
           REG_STATUS: ; // READ-ONLY
           REG_DATA_TX: begin
             for (int b = 0; b < STRB_WIDTH; b++)
-              if (wr_final_strb[b])
-                registers[REG_DATA_TX][b*8 +: 8] <= wr_final_data[b*8 +: 8];
+              if (w_strb_q[b])
+                registers[REG_DATA_TX][b*8 +: 8] <= w_data_q[b*8 +: 8];
           end
           REG_DATA_RX: ; // READ-ONLY
           REG_IRQ_EN: begin
             for (int b = 0; b < STRB_WIDTH; b++)
-              if (wr_final_strb[b])
-                registers[REG_IRQ_EN][b*8 +: 8] <= wr_final_data[b*8 +: 8];
+              if (w_strb_q[b])
+                registers[REG_IRQ_EN][b*8 +: 8] <= w_data_q[b*8 +: 8];
           end
           REG_IRQ_STAT: begin
             for (int b = 0; b < STRB_WIDTH; b++)
-              if (wr_final_strb[b])
+              if (w_strb_q[b])
                 for (int i = 0; i < 8; i++)
-                  if (wr_final_data[b*8 + i])
+                  if (w_data_q[b*8 + i])
                     registers[REG_IRQ_STAT][b*8 + i] <= 1'b0;
           end
           REG_SCRATCH: begin
             for (int b = 0; b < STRB_WIDTH; b++)
-              if (wr_final_strb[b])
-                registers[REG_SCRATCH][b*8 +: 8] <= wr_final_data[b*8 +: 8];
+              if (w_strb_q[b])
+                registers[REG_SCRATCH][b*8 +: 8] <= w_data_q[b*8 +: 8];
           end
           REG_VERSION: ; // READ-ONLY
           default: ;
