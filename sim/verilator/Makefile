@@ -6,7 +6,7 @@ rm -f Makefile
 # Naya Makefile create karo using printf (tab-safe method)
 printf '%s\n' \
 '###############################################################################' \
-'# Makefile for AXI4-Lite Slave simulation using Verilator' \
+'# Makefile for AXI4-Lite Slave simulation using Veril' \
 '###############################################################################' \
 '' \
 'RTL_DIR   = ../../rtl' \
