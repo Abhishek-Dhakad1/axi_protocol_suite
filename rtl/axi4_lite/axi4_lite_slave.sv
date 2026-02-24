@@ -52,18 +52,16 @@ module axi4_lite_slave
   // Register file
   logic [DATA_WIDTH-1:0] registers [NUM_REGS];
 
-  // Write FSM - now 4 states with explicit WRITE state
+  // Write FSM
   typedef enum logic [2:0] {
     S_WR_IDLE    = 3'b000,
     S_WR_GOT_AW = 3'b001,
     S_WR_GOT_W  = 3'b010,
-    S_WR_WRITE  = 3'b011,  // NEW: do actual register write here
-    S_WR_RESP   = 3'b100   // send BVALID, wait for BREADY
+    S_WR_WRITE  = 3'b011,
+    S_WR_RESP   = 3'b100
   } wr_state_e;
-
   wr_state_e wr_state_q;
 
-  // Latched values (stable one cycle after handshake)
   logic [ADDR_WIDTH-1:0] aw_addr_q;
   logic [DATA_WIDTH-1:0] w_data_q;
   logic [STRB_WIDTH-1:0] w_strb_q;
@@ -73,10 +71,9 @@ module axi4_lite_slave
     S_RD_IDLE = 1'b0,
     S_RD_RESP = 1'b1
   } rd_state_e;
-
   rd_state_e rd_state_q;
 
-  // Handshake detection
+  // Handshake
   logic aw_fire, w_fire, b_fire, ar_fire, r_fire;
   assign aw_fire = slv.awvalid & slv.awready;
   assign w_fire  = slv.wvalid  & slv.wready;
@@ -84,13 +81,17 @@ module axi4_lite_slave
   assign ar_fire = slv.arvalid & slv.arready;
   assign r_fire  = slv.rvalid  & slv.rready;
 
-  // Ready signals
+  // Ready
   assign slv.awready = (wr_state_q == S_WR_IDLE) || (wr_state_q == S_WR_GOT_W);
   assign slv.wready  = (wr_state_q == S_WR_IDLE) || (wr_state_q == S_WR_GOT_AW);
   assign slv.arready = (rd_state_q == S_RD_IDLE);
 
+  // Helper: register index
+  logic [$clog2(NUM_REGS)-1:0] wr_idx;
+  assign wr_idx = aw_addr_q[ADDR_MSB:ADDR_LSB];
+
   // ══════════════════════════════════════════
-  // WRITE FSM + LATCH
+  // SINGLE always_ff — ALL state + registers + outputs
   // ══════════════════════════════════════════
   always_ff @(posedge slv.aclk or negedge slv.aresetn) begin
     if (!slv.aresetn) begin
@@ -100,8 +101,27 @@ module axi4_lite_slave
       w_strb_q   <= '0;
       slv.bvalid <= 1'b0;
       slv.bresp  <= 2'b00;
+      rd_state_q <= S_RD_IDLE;
+      slv.rdata  <= '0;
+      slv.rresp  <= 2'b00;
+      slv.rvalid <= 1'b0;
+      for (int i = 0; i < NUM_REGS; i++)
+        registers[i] <= '0;
+      registers[REG_VERSION] <= IP_VERSION;
+
     end else begin
 
+      // ────────────────────────────────────────
+      // Hardware-driven register updates (every cycle)
+      // ────────────────────────────────────────
+      registers[REG_VERSION]      <= IP_VERSION;
+      registers[REG_STATUS][0]    <= registers[REG_CTRL][0];
+      registers[REG_STATUS][31:1] <= '0;
+      registers[REG_DATA_RX]     <= registers[REG_DATA_TX];
+
+      // ────────────────────────────────────────
+      // WRITE FSM
+      // ────────────────────────────────────────
       case (wr_state_q)
 
         S_WR_IDLE: begin
@@ -136,10 +156,47 @@ module axi4_lite_slave
           end
         end
 
-        // NEW STATE: Values are NOW stable in aw_addr_q, w_data_q, w_strb_q
-        // Register write happens in separate always_ff below
-        // Assert BVALID here
         S_WR_WRITE: begin
+          // aw_addr_q, w_data_q, w_strb_q are STABLE here
+          // (they were latched on the PREVIOUS cycle)
+          // DO THE ACTUAL REGISTER WRITE
+          if (aw_addr_q < ADDR_MAX) begin
+            case (wr_idx)
+              REG_CTRL: begin
+                for (int b = 0; b < STRB_WIDTH; b++)
+                  if (w_strb_q[b])
+                    registers[REG_CTRL][b*8 +: 8] <= w_data_q[b*8 +: 8];
+              end
+              REG_STATUS: ; // READ-ONLY
+              REG_DATA_TX: begin
+                for (int b = 0; b < STRB_WIDTH; b++)
+                  if (w_strb_q[b])
+                    registers[REG_DATA_TX][b*8 +: 8] <= w_data_q[b*8 +: 8];
+              end
+              REG_DATA_RX: ; // READ-ONLY
+              REG_IRQ_EN: begin
+                for (int b = 0; b < STRB_WIDTH; b++)
+                  if (w_strb_q[b])
+                    registers[REG_IRQ_EN][b*8 +: 8] <= w_data_q[b*8 +: 8];
+              end
+              REG_IRQ_STAT: begin
+                for (int b = 0; b < STRB_WIDTH; b++)
+                  if (w_strb_q[b])
+                    for (int i = 0; i < 8; i++)
+                      if (w_data_q[b*8 + i])
+                        registers[REG_IRQ_STAT][b*8 + i] <= 1'b0;
+              end
+              REG_SCRATCH: begin
+                for (int b = 0; b < STRB_WIDTH; b++)
+                  if (w_strb_q[b])
+                    registers[REG_SCRATCH][b*8 +: 8] <= w_data_q[b*8 +: 8];
+              end
+              REG_VERSION: ; // READ-ONLY
+              default: ;
+            endcase
+          end
+
+          // Assert BVALID
           slv.bvalid <= 1'b1;
           slv.bresp  <= (aw_addr_q < ADDR_MAX) ? RESP_OKAY : RESP_SLVERR;
           wr_state_q <= S_WR_RESP;
@@ -158,88 +215,10 @@ module axi4_lite_slave
           slv.bvalid <= 1'b0;
         end
       endcase
-    end
-  end
 
-  // ══════════════════════════════════════════
-  // REGISTER FILE: Write Logic
-  //
-  // Write happens when FSM is in S_WR_WRITE state.
-  // At this point aw_addr_q and w_data_q are GUARANTEED
-  // stable (they were latched on the previous cycle).
-  // ══════════════════════════════════════════
-  logic [$clog2(NUM_REGS)-1:0] wr_idx;
-  assign wr_idx = aw_addr_q[ADDR_MSB:ADDR_LSB];
-
-  logic wr_addr_ok;
-  assign wr_addr_ok = (aw_addr_q < ADDR_MAX);
-
-  always_ff @(posedge slv.aclk or negedge slv.aresetn) begin
-    if (!slv.aresetn) begin
-      registers[REG_CTRL]     <= '0;
-      registers[REG_STATUS]   <= '0;
-      registers[REG_DATA_TX]  <= '0;
-      registers[REG_DATA_RX]  <= '0;
-      registers[REG_IRQ_EN]   <= '0;
-      registers[REG_IRQ_STAT] <= '0;
-      registers[REG_SCRATCH]  <= '0;
-      registers[REG_VERSION]  <= IP_VERSION;
-    end else begin
-      // Hardware-driven (every cycle)
-      registers[REG_VERSION]      <= IP_VERSION;
-      registers[REG_STATUS][0]    <= registers[REG_CTRL][0];
-      registers[REG_STATUS][31:1] <= '0;
-      registers[REG_DATA_RX]     <= registers[REG_DATA_TX];
-
-      // AXI write: only in S_WR_WRITE state with valid address
-      if (wr_state_q == S_WR_WRITE && wr_addr_ok) begin
-        case (wr_idx)
-          REG_CTRL: begin
-            for (int b = 0; b < STRB_WIDTH; b++)
-              if (w_strb_q[b])
-                registers[REG_CTRL][b*8 +: 8] <= w_data_q[b*8 +: 8];
-          end
-          REG_STATUS: ; // READ-ONLY
-          REG_DATA_TX: begin
-            for (int b = 0; b < STRB_WIDTH; b++)
-              if (w_strb_q[b])
-                registers[REG_DATA_TX][b*8 +: 8] <= w_data_q[b*8 +: 8];
-          end
-          REG_DATA_RX: ; // READ-ONLY
-          REG_IRQ_EN: begin
-            for (int b = 0; b < STRB_WIDTH; b++)
-              if (w_strb_q[b])
-                registers[REG_IRQ_EN][b*8 +: 8] <= w_data_q[b*8 +: 8];
-          end
-          REG_IRQ_STAT: begin
-            for (int b = 0; b < STRB_WIDTH; b++)
-              if (w_strb_q[b])
-                for (int i = 0; i < 8; i++)
-                  if (w_data_q[b*8 + i])
-                    registers[REG_IRQ_STAT][b*8 + i] <= 1'b0;
-          end
-          REG_SCRATCH: begin
-            for (int b = 0; b < STRB_WIDTH; b++)
-              if (w_strb_q[b])
-                registers[REG_SCRATCH][b*8 +: 8] <= w_data_q[b*8 +: 8];
-          end
-          REG_VERSION: ; // READ-ONLY
-          default: ;
-        endcase
-      end
-    end
-  end
-
-  // ══════════════════════════════════════════
-  // READ FSM + DATA OUTPUT
-  // ══════════════════════════════════════════
-  always_ff @(posedge slv.aclk or negedge slv.aresetn) begin
-    if (!slv.aresetn) begin
-      rd_state_q <= S_RD_IDLE;
-      slv.rdata  <= '0;
-      slv.rresp  <= 2'b00;
-      slv.rvalid <= 1'b0;
-    end else begin
+      // ────────────────────────────────────────
+      // READ FSM
+      // ────────────────────────────────────────
       case (rd_state_q)
         S_RD_IDLE: begin
           if (ar_fire) begin
@@ -267,6 +246,7 @@ module axi4_lite_slave
           slv.rvalid <= 1'b0;
         end
       endcase
+
     end
   end
 
