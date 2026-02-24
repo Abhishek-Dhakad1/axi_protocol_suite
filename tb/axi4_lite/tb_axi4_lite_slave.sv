@@ -43,54 +43,36 @@ module tb_axi4_lite_slave;
     forever #(CLK_PERIOD / 2) aclk = ~aclk;
   end
 
-  axi4_lite_if #(
-    .ADDR_WIDTH(ADDR_WIDTH),
-    .DATA_WIDTH(DATA_WIDTH)
-  ) axi_if (
-    .aclk    (aclk),
-    .aresetn (aresetn)
-  );
+  axi4_lite_if #(.ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH))
+    axi_if (.aclk(aclk), .aresetn(aresetn));
 
-  axi4_lite_slave #(
-    .ADDR_WIDTH(ADDR_WIDTH),
-    .DATA_WIDTH(DATA_WIDTH)
-  ) u_dut (
-    .slv(axi_if.slave)
-  );
+  axi4_lite_slave #(.ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH))
+    u_dut (.slv(axi_if.slave));
 
   int total_tests  = 0;
   int passed_tests = 0;
   int failed_tests = 0;
 
-  // ══════════════════════════════════════════
+  // ── Init ──
   task automatic init_signals();
-    axi_if.awaddr  = '0;
-    axi_if.awprot  = 3'b000;
-    axi_if.awvalid = 1'b0;
-    axi_if.wdata   = '0;
-    axi_if.wstrb   = '0;
-    axi_if.wvalid  = 1'b0;
-    axi_if.bready  = 1'b0;
-    axi_if.araddr  = '0;
-    axi_if.arprot  = 3'b000;
-    axi_if.arvalid = 1'b0;
-    axi_if.rready  = 1'b0;
+    axi_if.awaddr  = '0; axi_if.awprot  = '0; axi_if.awvalid = 0;
+    axi_if.wdata   = '0; axi_if.wstrb   = '0; axi_if.wvalid  = 0;
+    axi_if.bready  = 0;
+    axi_if.araddr  = '0; axi_if.arprot  = '0; axi_if.arvalid = 0;
+    axi_if.rready  = 0;
   endtask
 
-  // ══════════════════════════════════════════
+  // ── Reset ──
   task automatic apply_reset();
-    $display("[%0t] Applying Reset...", $time);
-    aresetn = 1'b0;
-    init_signals();
-    repeat (5) @(posedge aclk);
-    aresetn = 1'b1;
-    repeat (2) @(posedge aclk);
-    $display("[%0t] Reset Released.\n", $time);
+    $display("[%0t] Reset...", $time);
+    aresetn = 0; init_signals();
+    repeat(5) @(posedge aclk);
+    aresetn = 1;
+    repeat(2) @(posedge aclk);
+    $display("[%0t] Reset done.\n", $time);
   endtask
 
-  // ══════════════════════════════════════════
-  // AXI Write: Single loop checks AW, W, B
-  // ══════════════════════════════════════════
+  // ── AXI Write (AW+W simultaneous) ──
   task automatic axi_write(
     input  logic [ADDR_WIDTH-1:0] addr,
     input  logic [DATA_WIDTH-1:0] data,
@@ -100,258 +82,172 @@ module tb_axi4_lite_slave;
     int cnt;
     logic aw_done, w_done;
 
-    @(posedge aclk);
-    #1;
-    axi_if.awaddr  = addr;
-    axi_if.awprot  = 3'b000;
-    axi_if.awvalid = 1'b1;
-    axi_if.wdata   = data;
-    axi_if.wstrb   = strb;
-    axi_if.wvalid  = 1'b1;
-    axi_if.bready  = 1'b1;
+    @(posedge aclk); #1;
+    axi_if.awaddr = addr; axi_if.awprot = '0; axi_if.awvalid = 1;
+    axi_if.wdata  = data; axi_if.wstrb  = strb; axi_if.wvalid = 1;
+    axi_if.bready = 1;
 
-    aw_done = 0;
-    w_done  = 0;
-    cnt     = 0;
-
-    while (cnt < 100) begin
+    aw_done = 0; w_done = 0; cnt = 0;
+    while (cnt < 200) begin
       @(posedge aclk);
       if (!aw_done && axi_if.awvalid && axi_if.awready) begin
-        aw_done = 1;
-        #1; axi_if.awvalid = 1'b0;
+        aw_done = 1; #1; axi_if.awvalid = 0;
       end
       if (!w_done && axi_if.wvalid && axi_if.wready) begin
-        w_done = 1;
-        #1; axi_if.wvalid = 1'b0;
+        w_done = 1; #1; axi_if.wvalid = 0;
       end
       if (axi_if.bvalid && axi_if.bready) begin
-        resp = axi_if.bresp;
-        #1; axi_if.bready = 1'b0;
+        resp = axi_if.bresp; #1; axi_if.bready = 0;
         break;
       end
       cnt++;
     end
-
-    if (cnt >= 100) begin
-      $display("[%0t] ERROR: Write timeout! addr=0x%08h", $time, addr);
+    if (cnt >= 200) begin
+      $display("[%0t] WR TIMEOUT addr=0x%08h", $time, addr);
       resp = 2'b11;
-      #1;
-      axi_if.awvalid = 1'b0;
-      axi_if.wvalid  = 1'b0;
-      axi_if.bready  = 1'b0;
+      #1; axi_if.awvalid=0; axi_if.wvalid=0; axi_if.bready=0;
     end else begin
-      $display("[%0t] WRITE: addr=0x%08h data=0x%08h strb=4'b%04b resp=%s",
-               $time, addr, data, strb,
-               (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
+      $display("[%0t] WR addr=0x%08h data=0x%08h strb=%04b resp=%s",
+        $time, addr, data, strb, (resp==RESP_OKAY)?"OK":"ERR");
     end
-    // Wait 2 cycles for register write to settle
     repeat(2) @(posedge aclk);
   endtask
 
-  // ══════════════════════════════════════════
-  // AXI Write: AW first, then W
-  // ══════════════════════════════════════════
+  // ── AXI Write: AW first ──
   task automatic axi_write_aw_first(
     input  logic [ADDR_WIDTH-1:0] addr,
     input  logic [DATA_WIDTH-1:0] data,
-    input  int                    delay,
-    output logic [1:0]            resp
+    input  int delay,
+    output logic [1:0] resp
   );
     int cnt;
-
-    $display("[%0t] WRITE(AW-first, %0d delay): addr=0x%08h", $time, delay, addr);
-
-    @(posedge aclk);
-    #1;
-    axi_if.awaddr  = addr;
-    axi_if.awprot  = 3'b000;
-    axi_if.awvalid = 1'b1;
-    axi_if.bready  = 1'b1;
-
+    @(posedge aclk); #1;
+    axi_if.awaddr = addr; axi_if.awprot = '0; axi_if.awvalid = 1;
+    axi_if.bready = 1;
     cnt = 0;
-    while (cnt < 100) begin
+    while (cnt < 200) begin
       @(posedge aclk);
       if (axi_if.awvalid && axi_if.awready) begin
-        #1; axi_if.awvalid = 1'b0;
-        break;
+        #1; axi_if.awvalid = 0; break;
       end
       cnt++;
     end
-
-    repeat (delay) @(posedge aclk);
-
+    repeat(delay) @(posedge aclk);
     #1;
-    axi_if.wdata  = data;
-    axi_if.wstrb  = '1;
-    axi_if.wvalid = 1'b1;
-
+    axi_if.wdata = data; axi_if.wstrb = '1; axi_if.wvalid = 1;
     cnt = 0;
-    while (cnt < 100) begin
+    while (cnt < 200) begin
       @(posedge aclk);
       if (axi_if.wvalid && axi_if.wready) begin
-        #1; axi_if.wvalid = 1'b0;
+        #1; axi_if.wvalid = 0;
       end
       if (axi_if.bvalid && axi_if.bready) begin
-        resp = axi_if.bresp;
-        #1; axi_if.bready = 1'b0;
-        break;
+        resp = axi_if.bresp; #1; axi_if.bready = 0; break;
       end
       cnt++;
     end
-
-    $display("[%0t]   -> resp=%s", $time,
-             (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
+    $display("[%0t] WR(AW-first) addr=0x%08h resp=%s",
+      $time, addr, (resp==RESP_OKAY)?"OK":"ERR");
     repeat(2) @(posedge aclk);
   endtask
 
-  // ══════════════════════════════════════════
-  // AXI Write: W first, then AW
-  // ══════════════════════════════════════════
+  // ── AXI Write: W first ──
   task automatic axi_write_w_first(
     input  logic [ADDR_WIDTH-1:0] addr,
     input  logic [DATA_WIDTH-1:0] data,
-    input  int                    delay,
-    output logic [1:0]            resp
+    input  int delay,
+    output logic [1:0] resp
   );
     int cnt;
-
-    $display("[%0t] WRITE(W-first, %0d delay): addr=0x%08h", $time, delay, addr);
-
-    @(posedge aclk);
-    #1;
-    axi_if.wdata  = data;
-    axi_if.wstrb  = '1;
-    axi_if.wvalid = 1'b1;
-    axi_if.bready = 1'b1;
-
+    @(posedge aclk); #1;
+    axi_if.wdata = data; axi_if.wstrb = '1; axi_if.wvalid = 1;
+    axi_if.bready = 1;
     cnt = 0;
-    while (cnt < 100) begin
+    while (cnt < 200) begin
       @(posedge aclk);
       if (axi_if.wvalid && axi_if.wready) begin
-        #1; axi_if.wvalid = 1'b0;
-        break;
+        #1; axi_if.wvalid = 0; break;
       end
       cnt++;
     end
-
-    repeat (delay) @(posedge aclk);
-
+    repeat(delay) @(posedge aclk);
     #1;
-    axi_if.awaddr  = addr;
-    axi_if.awprot  = 3'b000;
-    axi_if.awvalid = 1'b1;
-
+    axi_if.awaddr = addr; axi_if.awprot = '0; axi_if.awvalid = 1;
     cnt = 0;
-    while (cnt < 100) begin
+    while (cnt < 200) begin
       @(posedge aclk);
       if (axi_if.awvalid && axi_if.awready) begin
-        #1; axi_if.awvalid = 1'b0;
+        #1; axi_if.awvalid = 0;
       end
       if (axi_if.bvalid && axi_if.bready) begin
-        resp = axi_if.bresp;
-        #1; axi_if.bready = 1'b0;
-        break;
+        resp = axi_if.bresp; #1; axi_if.bready = 0; break;
       end
       cnt++;
     end
-
-    $display("[%0t]   -> resp=%s", $time,
-             (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
+    $display("[%0t] WR(W-first) addr=0x%08h resp=%s",
+      $time, addr, (resp==RESP_OKAY)?"OK":"ERR");
     repeat(2) @(posedge aclk);
   endtask
 
-  // ══════════════════════════════════════════
-  // AXI Read
-  // ══════════════════════════════════════════
+  // ── AXI Read ──
   task automatic axi_read(
     input  logic [ADDR_WIDTH-1:0] addr,
     output logic [DATA_WIDTH-1:0] data,
-    output logic [1:0]            resp
+    output logic [1:0] resp
   );
     int cnt;
     logic ar_done;
-
-    @(posedge aclk);
-    #1;
-    axi_if.araddr  = addr;
-    axi_if.arprot  = 3'b000;
-    axi_if.arvalid = 1'b1;
-    axi_if.rready  = 1'b1;
-
-    ar_done = 0;
-    cnt = 0;
-
-    while (cnt < 100) begin
+    @(posedge aclk); #1;
+    axi_if.araddr = addr; axi_if.arprot = '0; axi_if.arvalid = 1;
+    axi_if.rready = 1;
+    ar_done = 0; cnt = 0;
+    while (cnt < 200) begin
       @(posedge aclk);
       if (!ar_done && axi_if.arvalid && axi_if.arready) begin
-        ar_done = 1;
-        #1; axi_if.arvalid = 1'b0;
+        ar_done = 1; #1; axi_if.arvalid = 0;
       end
       if (axi_if.rvalid && axi_if.rready) begin
-        data = axi_if.rdata;
-        resp = axi_if.rresp;
-        #1; axi_if.rready = 1'b0;
-        break;
+        data = axi_if.rdata; resp = axi_if.rresp;
+        #1; axi_if.rready = 0; break;
       end
       cnt++;
     end
-
-    if (cnt >= 100) begin
-      $display("[%0t] ERROR: Read timeout! addr=0x%08h", $time, addr);
-      data = 32'hDEADDEAD;
-      resp = 2'b11;
-      #1;
-      axi_if.arvalid = 1'b0;
-      axi_if.rready  = 1'b0;
+    if (cnt >= 200) begin
+      $display("[%0t] RD TIMEOUT addr=0x%08h", $time, addr);
+      data = 32'hDEADDEAD; resp = 2'b11;
+      #1; axi_if.arvalid=0; axi_if.rready=0;
     end else begin
-      $display("[%0t] READ:  addr=0x%08h data=0x%08h resp=%s",
-               $time, addr, data,
-               (resp == RESP_OKAY) ? "OKAY" : "SLVERR");
+      $display("[%0t] RD addr=0x%08h data=0x%08h resp=%s",
+        $time, addr, data, (resp==RESP_OKAY)?"OK":"ERR");
     end
     @(posedge aclk);
   endtask
 
-  // ══════════════════════════════════════════
-  task automatic read_and_check(
+  // ── Check helpers ──
+  task automatic read_check(
     input logic [ADDR_WIDTH-1:0] addr,
     input logic [DATA_WIDTH-1:0] expected,
-    input string                 test_name
+    input string name
   );
-    logic [DATA_WIDTH-1:0] got_data;
-    logic [1:0]            got_resp;
-    axi_read(addr, got_data, got_resp);
+    logic [DATA_WIDTH-1:0] d; logic [1:0] r;
+    axi_read(addr, d, r);
     total_tests++;
-    if (got_data === expected && got_resp === RESP_OKAY) begin
+    if (d === expected && r === RESP_OKAY) begin
       passed_tests++;
-      $display("[%0t] PASS: %s | Exp=0x%08h Got=0x%08h",
-               $time, test_name, expected, got_data);
+      $display("[%0t] PASS %s exp=0x%08h got=0x%08h", $time, name, expected, d);
     end else begin
       failed_tests++;
-      $display("[%0t] FAIL: %s | Exp=0x%08h Got=0x%08h Resp=%02b",
-               $time, test_name, expected, got_data, got_resp);
+      $display("[%0t] FAIL %s exp=0x%08h got=0x%08h r=%02b", $time, name, expected, d, r);
     end
   endtask
 
-  // ══════════════════════════════════════════
-  task automatic check_resp(
-    input logic [1:0] got,
-    input logic [1:0] expected,
-    input string      test_name
-  );
+  task automatic check_resp(input logic [1:0] got, exp; input string name);
     total_tests++;
-    if (got === expected) begin
-      passed_tests++;
-      $display("[%0t] PASS: %s", $time, test_name);
-    end else begin
-      failed_tests++;
-      $display("[%0t] FAIL: %s | Exp=%02b Got=%02b",
-               $time, test_name, expected, got);
-    end
+    if (got === exp) begin passed_tests++; $display("[%0t] PASS %s", $time, name); end
+    else begin failed_tests++; $display("[%0t] FAIL %s exp=%02b got=%02b", $time, name, exp, got); end
   endtask
 
-  // ══════════════════════════════════════════
-  // MAIN TEST
-  // ══════════════════════════════════════════
+  // ── Main ──
   logic [DATA_WIDTH-1:0] rd_data;
   logic [1:0] wr_resp, rd_resp;
 
@@ -359,139 +255,122 @@ module tb_axi4_lite_slave;
     $dumpfile("axi4_lite_slave.vcd");
     $dumpvars(0, tb_axi4_lite_slave);
 
-    $display("\n");
-    $display("==================================================");
-    $display("  AXI4-Lite Slave Testbench");
-    $display("  Author: Abhishek Dhakad");
-    $display("==================================================");
-
+    $display("\n==== AXI4-Lite Slave TB - Abhishek Dhakad ====\n");
     apply_reset();
 
-    // TEST 1
-    $display("\n-- TEST 1: VERSION register after reset --");
-    read_and_check(REG_VERSION_OFFSET, IP_VERSION, "VERSION after reset");
+    // T1: VERSION after reset
+    $display("-- T1: VERSION --");
+    read_check(REG_VERSION_OFFSET, IP_VERSION, "VERSION");
 
-    // TEST 2
-    $display("\n-- TEST 2: CTRL register after reset --");
-    read_and_check(REG_CTRL_OFFSET, 32'h0, "CTRL after reset");
+    // T2: CTRL after reset
+    $display("-- T2: CTRL reset --");
+    read_check(REG_CTRL_OFFSET, 32'h0, "CTRL_RST");
 
-    // TEST 3
-    $display("\n-- TEST 3: Write/Read CTRL --");
+    // T3: Write/Read CTRL
+    $display("-- T3: W/R CTRL --");
     axi_write(REG_CTRL_OFFSET, 32'hCAFEBABE, 4'b1111, wr_resp);
-    check_resp(wr_resp, RESP_OKAY, "CTRL write resp");
-    read_and_check(REG_CTRL_OFFSET, 32'hCAFEBABE, "CTRL readback");
+    check_resp(wr_resp, RESP_OKAY, "CTRL_WR");
+    read_check(REG_CTRL_OFFSET, 32'hCAFEBABE, "CTRL_RD");
 
-    // TEST 4
-    $display("\n-- TEST 4: Write/Read SCRATCH --");
+    // T4: Write/Read SCRATCH
+    $display("-- T4: W/R SCRATCH --");
     axi_write(REG_SCRATCH_OFFSET, 32'hDEADBEEF, 4'b1111, wr_resp);
-    check_resp(wr_resp, RESP_OKAY, "SCRATCH write resp");
-    read_and_check(REG_SCRATCH_OFFSET, 32'hDEADBEEF, "SCRATCH readback");
+    check_resp(wr_resp, RESP_OKAY, "SCRATCH_WR");
+    read_check(REG_SCRATCH_OFFSET, 32'hDEADBEEF, "SCRATCH_RD");
 
-    // TEST 5
-    $display("\n-- TEST 5: DATA_TX -> DATA_RX loopback --");
+    // T5: TX->RX loopback
+    $display("-- T5: TX->RX --");
     axi_write(REG_DATA_TX_OFFSET, 32'h12345678, 4'b1111, wr_resp);
-    check_resp(wr_resp, RESP_OKAY, "DATA_TX write resp");
-    read_and_check(REG_DATA_TX_OFFSET, 32'h12345678, "DATA_TX readback");
-    repeat (3) @(posedge aclk);
-    read_and_check(REG_DATA_RX_OFFSET, 32'h12345678, "DATA_RX loopback");
+    check_resp(wr_resp, RESP_OKAY, "TX_WR");
+    read_check(REG_DATA_TX_OFFSET, 32'h12345678, "TX_RD");
+    repeat(3) @(posedge aclk);
+    read_check(REG_DATA_RX_OFFSET, 32'h12345678, "RX_LB");
 
-    // TEST 6
-    $display("\n-- TEST 6: Write to READ-ONLY VERSION --");
+    // T6: Write to RO VERSION
+    $display("-- T6: WR to VERSION(RO) --");
     axi_write(REG_VERSION_OFFSET, 32'hFFFFFFFF, 4'b1111, wr_resp);
-    check_resp(wr_resp, RESP_OKAY, "VERSION write resp (ignored)");
-    read_and_check(REG_VERSION_OFFSET, IP_VERSION, "VERSION unchanged");
+    check_resp(wr_resp, RESP_OKAY, "VER_WR");
+    read_check(REG_VERSION_OFFSET, IP_VERSION, "VER_RO");
 
-    // TEST 7
-    $display("\n-- TEST 7: WSTRB - byte 0 only --");
+    // T7: WSTRB byte0
+    $display("-- T7: WSTRB byte0 --");
     axi_write(REG_SCRATCH_OFFSET, 32'hAABBCCDD, 4'b1111, wr_resp);
-    read_and_check(REG_SCRATCH_OFFSET, 32'hAABBCCDD, "SCRATCH = 0xAABBCCDD");
+    read_check(REG_SCRATCH_OFFSET, 32'hAABBCCDD, "SCR_FULL");
     axi_write(REG_SCRATCH_OFFSET, 32'h11111111, 4'b0001, wr_resp);
-    read_and_check(REG_SCRATCH_OFFSET, 32'hAABBCC11, "SCRATCH byte0 only");
+    read_check(REG_SCRATCH_OFFSET, 32'hAABBCC11, "SCR_B0");
 
-    // TEST 8
-    $display("\n-- TEST 8: WSTRB - upper 2 bytes --");
+    // T8: WSTRB upper
+    $display("-- T8: WSTRB upper --");
     axi_write(REG_SCRATCH_OFFSET, 32'hFF00FF00, 4'b1100, wr_resp);
-    read_and_check(REG_SCRATCH_OFFSET, 32'hFF00CC11, "SCRATCH upper bytes");
+    read_check(REG_SCRATCH_OFFSET, 32'hFF00CC11, "SCR_UP");
 
-    // TEST 9
-    $display("\n-- TEST 9: Out-of-range write -> SLVERR --");
-    axi_write(32'h00000100, 32'hBAADF00D, 4'b1111, wr_resp);
-    check_resp(wr_resp, RESP_SLVERR, "Out-of-range write SLVERR");
+    // T9: OOR write
+    $display("-- T9: OOR write --");
+    axi_write(32'h100, 32'hBAADF00D, 4'b1111, wr_resp);
+    check_resp(wr_resp, RESP_SLVERR, "OOR_WR");
 
-    // TEST 10
-    $display("\n-- TEST 10: Out-of-range read -> SLVERR --");
-    axi_read(32'h00000100, rd_data, rd_resp);
+    // T10: OOR read
+    $display("-- T10: OOR read --");
+    axi_read(32'h100, rd_data, rd_resp);
     total_tests++;
     if (rd_resp === RESP_SLVERR) begin
-      passed_tests++;
-      $display("[%0t] PASS: Out-of-range read SLVERR", $time);
+      passed_tests++; $display("[%0t] PASS OOR_RD", $time);
     end else begin
-      failed_tests++;
-      $display("[%0t] FAIL: Expected SLVERR got %02b", $time, rd_resp);
+      failed_tests++; $display("[%0t] FAIL OOR_RD exp=SLVERR got=%02b", $time, rd_resp);
     end
 
-    // TEST 11
-    $display("\n-- TEST 11: AW before W (2 cycle gap) --");
+    // T11: AW before W
+    $display("-- T11: AW first --");
     axi_write_aw_first(REG_SCRATCH_OFFSET, 32'hAAAA1111, 2, wr_resp);
-    check_resp(wr_resp, RESP_OKAY, "AW-first write resp");
-    read_and_check(REG_SCRATCH_OFFSET, 32'hAAAA1111, "AW-first readback");
+    check_resp(wr_resp, RESP_OKAY, "AWF_WR");
+    read_check(REG_SCRATCH_OFFSET, 32'hAAAA1111, "AWF_RD");
 
-    // TEST 12
-    $display("\n-- TEST 12: W before AW (3 cycle gap) --");
+    // T12: W before AW
+    $display("-- T12: W first --");
     axi_write_w_first(REG_SCRATCH_OFFSET, 32'hBBBB2222, 3, wr_resp);
-    check_resp(wr_resp, RESP_OKAY, "W-first write resp");
-    read_and_check(REG_SCRATCH_OFFSET, 32'hBBBB2222, "W-first readback");
+    check_resp(wr_resp, RESP_OKAY, "WF_WR");
+    read_check(REG_SCRATCH_OFFSET, 32'hBBBB2222, "WF_RD");
 
-    // TEST 13
-    $display("\n-- TEST 13: Back-to-back writes --");
-    axi_write(REG_SCRATCH_OFFSET, 32'h00000001, 4'b1111, wr_resp);
-    axi_write(REG_SCRATCH_OFFSET, 32'h00000002, 4'b1111, wr_resp);
-    axi_write(REG_SCRATCH_OFFSET, 32'h00000003, 4'b1111, wr_resp);
-    axi_write(REG_SCRATCH_OFFSET, 32'h00000004, 4'b1111, wr_resp);
-    read_and_check(REG_SCRATCH_OFFSET, 32'h00000004, "B2B final value");
+    // T13: B2B writes
+    $display("-- T13: B2B writes --");
+    axi_write(REG_SCRATCH_OFFSET, 32'h1, 4'b1111, wr_resp);
+    axi_write(REG_SCRATCH_OFFSET, 32'h2, 4'b1111, wr_resp);
+    axi_write(REG_SCRATCH_OFFSET, 32'h3, 4'b1111, wr_resp);
+    axi_write(REG_SCRATCH_OFFSET, 32'h4, 4'b1111, wr_resp);
+    read_check(REG_SCRATCH_OFFSET, 32'h4, "B2B_FINAL");
 
-    // TEST 14
-    $display("\n-- TEST 14: Back-to-back reads --");
+    // T14: B2B reads
+    $display("-- T14: B2B reads --");
     axi_write(REG_CTRL_OFFSET, 32'hFFFF0000, 4'b1111, wr_resp);
-    read_and_check(REG_CTRL_OFFSET, 32'hFFFF0000, "B2B read 1");
-    read_and_check(REG_CTRL_OFFSET, 32'hFFFF0000, "B2B read 2");
-    read_and_check(REG_CTRL_OFFSET, 32'hFFFF0000, "B2B read 3");
+    read_check(REG_CTRL_OFFSET, 32'hFFFF0000, "B2B_R1");
+    read_check(REG_CTRL_OFFSET, 32'hFFFF0000, "B2B_R2");
+    read_check(REG_CTRL_OFFSET, 32'hFFFF0000, "B2B_R3");
 
-    // TEST 15
-    $display("\n-- TEST 15: Write all, Read all --");
+    // T15: Write all, read all
+    $display("-- T15: All regs --");
     axi_write(REG_CTRL_OFFSET,    32'h11111111, 4'b1111, wr_resp);
     axi_write(REG_DATA_TX_OFFSET, 32'h22222222, 4'b1111, wr_resp);
     axi_write(REG_IRQ_EN_OFFSET,  32'h33333333, 4'b1111, wr_resp);
     axi_write(REG_SCRATCH_OFFSET, 32'h44444444, 4'b1111, wr_resp);
-    read_and_check(REG_CTRL_OFFSET,    32'h11111111, "Final CTRL");
-    read_and_check(REG_DATA_TX_OFFSET, 32'h22222222, "Final DATA_TX");
-    repeat (3) @(posedge aclk);
-    read_and_check(REG_DATA_RX_OFFSET, 32'h22222222, "Final DATA_RX");
-    read_and_check(REG_IRQ_EN_OFFSET,  32'h33333333, "Final IRQ_EN");
-    read_and_check(REG_SCRATCH_OFFSET, 32'h44444444, "Final SCRATCH");
-    read_and_check(REG_VERSION_OFFSET, IP_VERSION,    "Final VERSION");
+    read_check(REG_CTRL_OFFSET,    32'h11111111, "ALL_CTRL");
+    read_check(REG_DATA_TX_OFFSET, 32'h22222222, "ALL_TX");
+    repeat(3) @(posedge aclk);
+    read_check(REG_DATA_RX_OFFSET, 32'h22222222, "ALL_RX");
+    read_check(REG_IRQ_EN_OFFSET,  32'h33333333, "ALL_IRQ");
+    read_check(REG_SCRATCH_OFFSET, 32'h44444444, "ALL_SCR");
+    read_check(REG_VERSION_OFFSET, IP_VERSION,    "ALL_VER");
 
-    // SUMMARY
-    repeat (10) @(posedge aclk);
-    $display("\n==================================================");
-    $display("  TEST SUMMARY");
-    $display("==================================================");
-    $display("  Total:  %0d", total_tests);
-    $display("  Passed: %0d", passed_tests);
-    $display("  Failed: %0d", failed_tests);
-    $display("==================================================");
-    if (failed_tests == 0)
-      $display("  >>> ALL TESTS PASSED! <<<");
-    else
-      $display("  >>> SOME TESTS FAILED! <<<");
-    $display("==================================================\n");
+    // Summary
+    repeat(5) @(posedge aclk);
+    $display("\n==== SUMMARY ====");
+    $display("Total: %0d  Pass: %0d  Fail: %0d", total_tests, passed_tests, failed_tests);
+    if (failed_tests == 0) $display(">>> ALL TESTS PASSED <<<");
+    else                   $display(">>> SOME FAILED <<<");
+    $display("=================\n");
     $finish;
   end
 
-  initial begin
-    #1_000_000;
-    $display("\n[%0t] TIMEOUT!", $time);
-    $finish;
-  end
+  // Timeout
+  initial begin #2_000_000; $display("TIMEOUT"); $finish; end
 
 endmodule : tb_axi4_lite_slave
